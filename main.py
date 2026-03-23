@@ -292,23 +292,22 @@ class TimerView(NSView):
         return True
 
     def mouseDown_(self, event):
-        f = self.window().frame()
-        loc = event.screenLocation()
-        self._press = (loc.x, loc.y, f.origin.x, f.origin.y)
-        self._moved = False
+        self._press   = True
+        self._moved   = False
+        self._accum_d = 0.0  # accumulated drag distance
 
     def mouseDragged_(self, event):
         if not self._press:
             return
-        px, py, wx, wy = self._press
-        loc = event.screenLocation()
-        dx, dy = loc.x - px, loc.y - py
-        if abs(dx) > 5 or abs(dy) > 5:
+        dx =  event.deltaX()
+        dy = -event.deltaY()   # AppKit Y軸は上向き正なので反転
+        self._accum_d += abs(dx) + abs(dy)
+        if self._accum_d > 5:
             self._moved = True
         if self._moved:
             f = self.window().frame()
-            f.origin.x = wx + dx
-            f.origin.y = wy + dy
+            f.origin.x += dx
+            f.origin.y += dy
             self.window().setFrame_display_(f, True)
 
     def mouseUp_(self, event):
@@ -318,8 +317,9 @@ class TimerView(NSView):
         elif self._moved and self.ts:
             f = self.window().frame()
             self.ts.save(int(f.origin.x), int(f.origin.y))
-        self._press = None
-        self._moved = False
+        self._press   = None
+        self._moved   = False
+        self._accum_d = 0.0
 
     def rightMouseDown_(self, event):
         if not self.ts:
