@@ -485,6 +485,7 @@ class AppDelegate(NSObject):
             NSWindowCollectionBehaviorStationary)
         panel.setIgnoresMouseEvents_(False)
         panel.setMovableByWindowBackground_(False)
+        panel.setHidesOnDeactivate_(False)
 
         view = TimerView.alloc().initWithFrame_(
             NSMakeRect(0, 0, W, W))
