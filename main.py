@@ -8,6 +8,7 @@ from AppKit import (
     NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
     NSAttributedString, NSParagraphStyleAttributeName,
     NSMutableParagraphStyle, NSCenterTextAlignment,
+    NSShadow, NSShadowAttributeName,
     NSMenu, NSMenuItem, NSTrackingArea,
     NSBackingStoreBuffered, NSFloatingWindowLevel,
     NSMakeRect, NSMakePoint, NSMakeSize,
@@ -198,11 +199,15 @@ class TimerView(NSView):
         acc = ts.accent_hex
         center = NSMakePoint(CX, CY)
 
-        # ── Base ring ────────────────────────────────────────────────────────
-        ring = NSBezierPath.bezierPathWithOvalInRect_(
-            NSMakeRect(CX - R, CY - R, R * 2, R * 2))
+        # ── Base ring (subtle glow + stroke) ─────────────────────────────────
+        oval_rect = NSMakeRect(CX - R, CY - R, R * 2, R * 2)
+        glow = NSBezierPath.bezierPathWithOvalInRect_(oval_rect)
+        glow.setLineWidth_(4.0)
+        ns(t['base'], 0.25).set()
+        glow.stroke()
+        ring = NSBezierPath.bezierPathWithOvalInRect_(oval_rect)
         ring.setLineWidth_(1.0)
-        ns(t['base'], 0.75).set()
+        ns(t['base'], 0.9).set()
         ring.stroke()
 
         # ── Gradient arc ─────────────────────────────────────────────────────
@@ -230,10 +235,14 @@ class TimerView(NSView):
                NSFont.boldSystemFontOfSize_(22.0)
         para = NSMutableParagraphStyle.alloc().init()
         para.setAlignment_(NSCenterTextAlignment)
+        shadow = NSShadow.alloc().init()
+        shadow.setShadowColor_(NSColor.colorWithWhite_alpha_(0.0, 0.7))
+        shadow.setShadowOffset_(NSMakeSize(0, -1))
+        shadow.setShadowBlurRadius_(4.0)
         attrs = {
             NSFontAttributeName: font,
-            NSForegroundColorAttributeName: ns(acc, 0.92 if vis else 0.0),
-            NSParagraphStyleAttributeName: para,
+            NSForegroundColorAttributeName: ns(acc, 0.95 if vis else 0.0),
+            NSShadowAttributeName: shadow,
         }
         ns_str = NSAttributedString.alloc().initWithString_attributes_(time_str, attrs)
         sz = ns_str.size()
@@ -414,10 +423,16 @@ class AppDelegate(NSObject):
     def applicationDidFinishLaunching_(self, note):
         ts = TimerState()
 
-        # Position
+        # Position (AppKit: y=0 is bottom of screen)
         screen = NSScreen.mainScreen().visibleFrame()
-        x = ts.cfg_x if ts.cfg_x is not None else screen.origin.x + screen.size.width  - W - 20
-        y = ts.cfg_y if ts.cfg_y is not None else screen.origin.y + 20
+        full_h = NSScreen.mainScreen().frame().size.height
+        if ts.cfg_x is not None and ts.cfg_y is not None:
+            x = ts.cfg_x
+            # Convert old tkinter coords (y from top) to AppKit (y from bottom) if needed
+            y = ts.cfg_y if ts.cfg_y > full_h / 2 else full_h - ts.cfg_y - W
+        else:
+            x = screen.origin.x + screen.size.width - W - 20
+            y = screen.origin.y + screen.size.height - W - 20  # top-right
 
         # Create transparent floating panel
         panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
