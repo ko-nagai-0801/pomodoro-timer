@@ -504,7 +504,10 @@ class AppDelegate(NSObject):
         self.view.setNeedsDisplay_(True)
 
     def applicationShouldTerminateAfterLastWindowClosed_(self, _):
-        return True
+        # NSPanel は "window" としてカウントされないため、
+        # メニューを閉じた瞬間に終了しないよう False を返す。
+        # 終了は右クリック→「終了」メニューから行う。
+        return False
 
 
 # ---------------------------------------------------------------------------
