@@ -368,32 +368,71 @@ class TimerView(NSView):
 
         NSMenu.popUpContextMenu_withEvent_forView_(menu, event, self)
 
+    def _refresh(self):
+        self.setNeedsDisplay_(True)
+
     def menuReset_(self, sender):
-        self.ts.reset()
+        try:
+            self.ts.reset()
+            self._refresh()
+        except Exception as e:
+            print(f'menuReset_ error: {e}')
+
     def menuSkip_(self, sender):
-        self.ts.skip()
+        try:
+            self.ts.skip()
+            self._refresh()
+        except Exception as e:
+            print(f'menuSkip_ error: {e}')
+
     def menuToggleWork_(self, sender):
-        ts = self.ts
-        wi = ts.WORK_OPTIONS.index(ts.work_duration) if ts.work_duration in ts.WORK_OPTIONS else 0
-        ts.work_duration = ts.WORK_OPTIONS[(wi + 1) % len(ts.WORK_OPTIONS)]
-        if ts.is_focus and ts.state == ts.IDLE:
-            ts.remaining = ts.total_secs = ts.work_duration
-        ts.save()
+        try:
+            ts = self.ts
+            wi = ts.WORK_OPTIONS.index(ts.work_duration) if ts.work_duration in ts.WORK_OPTIONS else 0
+            ts.work_duration = ts.WORK_OPTIONS[(wi + 1) % len(ts.WORK_OPTIONS)]
+            if ts.is_focus and ts.state == ts.IDLE:
+                ts.remaining = ts.total_secs = ts.work_duration
+            ts.save()
+            self._refresh()
+        except Exception as e:
+            print(f'menuToggleWork_ error: {e}')
+
     def menuToggleBreak_(self, sender):
-        ts = self.ts
-        bi = ts.BREAK_OPTIONS.index(ts.break_duration) if ts.break_duration in ts.BREAK_OPTIONS else 0
-        ts.break_duration = ts.BREAK_OPTIONS[(bi + 1) % len(ts.BREAK_OPTIONS)]
-        if not ts.is_focus and ts.state == ts.IDLE:
-            ts.remaining = ts.total_secs = ts.break_duration
-        ts.save()
+        try:
+            ts = self.ts
+            bi = ts.BREAK_OPTIONS.index(ts.break_duration) if ts.break_duration in ts.BREAK_OPTIONS else 0
+            ts.break_duration = ts.BREAK_OPTIONS[(bi + 1) % len(ts.BREAK_OPTIONS)]
+            if not ts.is_focus and ts.state == ts.IDLE:
+                ts.remaining = ts.total_secs = ts.break_duration
+            ts.save()
+            self._refresh()
+        except Exception as e:
+            print(f'menuToggleBreak_ error: {e}')
+
     def menuSetTheme_(self, sender):
-        self.ts.color_theme = sender.representedObject()
-        self.ts.save()
+        try:
+            key = str(sender.representedObject())  # NSString → Python str
+            if key in THEMES:
+                self.ts.color_theme = key
+                self.ts.save()
+                self._refresh()
+        except Exception as e:
+            print(f'menuSetTheme_ error: {e}')
+
     def menuToggleAuto_(self, sender):
-        self.ts.auto_start = not self.ts.auto_start
-        self.ts.save()
+        try:
+            self.ts.auto_start = not self.ts.auto_start
+            self.ts.save()
+            self._refresh()
+        except Exception as e:
+            print(f'menuToggleAuto_ error: {e}')
+
     def menuQuit_(self, sender):
-        NSApplication.sharedApplication().terminate_(None)
+        try:
+            self.ts.save()
+            NSApplication.sharedApplication().terminate_(None)
+        except Exception as e:
+            print(f'menuQuit_ error: {e}')
 
     # ── Hover tracking ────────────────────────────────────────────────────────
     def mouseEntered_(self, event):
