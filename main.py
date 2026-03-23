@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Pomodoro Timer – Pure AppKit transparent floating overlay"""
 
-import time, json, os, tempfile, math
+import time, json, os, tempfile, subprocess
+from datetime import date
 import objc
 from AppKit import (
     NSApplication, NSPanel, NSView, NSColor, NSBezierPath,
@@ -16,13 +17,14 @@ from AppKit import (
     NSApplicationActivationPolicyAccessory,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorStationary,
-    NSScreen,
+    NSScreen, NSSound,
 )
-from Foundation import NSObject, NSTimer, NSDate
+from Foundation import NSObject, NSTimer
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
-W = 140  # window size (points)
+W = 140          # window size (points)
 CX, CY, R = 70.0, 70.0, 55.0  # circle center and radius
+COORDS_VERSION = 2  # AppKit座標系マーカー（旧tkinter座標との区別用）
 
 # ---------------------------------------------------------------------------
 # Color themes
@@ -49,8 +51,9 @@ def ns(h: str, a: float = 1.0) -> NSColor:
 # ---------------------------------------------------------------------------
 class TimerState:
     IDLE, RUNNING, PAUSED, FINISHED = 'idle', 'running', 'paused', 'finished'
-    WORK_OPTIONS  = [25 * 60, 50 * 60]
-    BREAK_OPTIONS = [5 * 60, 10 * 60]
+    WORK_OPTIONS    = [25 * 60, 50 * 60]
+    BREAK_OPTIONS   = [5 * 60, 10 * 60]
+    OPACITY_OPTIONS = [1.0, 0.6, 0.3]
     LONG_BREAK = 15 * 60
     SET_SIZE   = 4
 
@@ -67,8 +70,9 @@ class TimerState:
 
     def _load_config(self):
         d = dict(work_duration=25*60, break_duration=5*60,
-                 window_x=None, window_y=None,
-                 pomodoro_count=0, auto_start=False, color_theme='blue')
+                 window_x=None, window_y=None, coords_version=0,
+                 pomodoro_count=0, last_date='',
+                 auto_start=False, color_theme='blue', opacity=1.0)
         try:
             with open(CONFIG_PATH) as f:
                 d.update(json.load(f))
@@ -78,19 +82,28 @@ class TimerState:
         self.break_duration = int(d['break_duration'])
         self.cfg_x = d['window_x']
         self.cfg_y = d['window_y']
-        self.pomodoro_count = int(d.get('pomodoro_count', 0))
+        self.coords_version = int(d.get('coords_version', 0))
+        # 日付が変わったらポモドーロカウントをリセット
+        today = date.today().isoformat()
+        last_date = d.get('last_date', '')
+        self.pomodoro_count = 0 if last_date != today else int(d.get('pomodoro_count', 0))
+        self.last_date   = today
         self.auto_start  = bool(d.get('auto_start', False))
         self.color_theme = d.get('color_theme', 'blue')
         if self.color_theme not in THEMES:
             self.color_theme = 'blue'
+        self.opacity = float(d.get('opacity', 1.0))
 
     def save(self, wx=None, wy=None):
         data = dict(work_duration=self.work_duration,
                     break_duration=self.break_duration,
                     window_x=wx, window_y=wy,
+                    coords_version=COORDS_VERSION,
                     pomodoro_count=self.pomodoro_count,
+                    last_date=self.last_date,
                     auto_start=self.auto_start,
-                    color_theme=self.color_theme)
+                    color_theme=self.color_theme,
+                    opacity=self.opacity)
         try:
             fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CONFIG_PATH))
             with os.fdopen(fd, 'w') as f:
@@ -114,6 +127,23 @@ class TimerState:
             return self.LONG_BREAK
         return self.break_duration
 
+    def _notify_finish(self):
+        """タイマー終了時に音と通知を送る"""
+        # システムサウンド
+        try:
+            snd = NSSound.soundNamed_('Glass')
+            if snd:
+                snd.play()
+        except Exception:
+            pass
+        # macOS通知
+        try:
+            msg = '休憩時間です！' if self.is_focus else '集中を再開しましょう！'
+            subprocess.Popen(['osascript', '-e',
+                f'display notification "{msg}" with title "Pomodoro Timer"'])
+        except Exception:
+            pass
+
     def update(self):
         if self.state == self.RUNNING:
             self.remaining = max(0, int(self._paused_rem - (time.time() - self._start_time)))
@@ -123,6 +153,7 @@ class TimerState:
                 if self.is_focus:
                     self.pomodoro_count += 1
                 self.save()
+                self._notify_finish()
         if self.state == self.FINISHED and time.time() - self._flash_t >= 1.5:
             self.is_focus = not self.is_focus
             dur = self.work_duration if self.is_focus else self.calc_break()
@@ -179,9 +210,10 @@ class TimerView(NSView):
     def initWithFrame_(self, frame):
         self = objc.super(TimerView, self).initWithFrame_(frame)
         if self is not None:
-            self.ts = None   # TimerState, set by delegate
-            self._press = None
-            self._moved = False
+            self.ts = None
+            self._press   = None
+            self._moved   = False
+            self._accum_d = 0.0
         return self
 
     # ── Drawing ──────────────────────────────────────────────────────────────
@@ -210,15 +242,24 @@ class TimerView(NSView):
         ns(t['base'], 0.9).set()
         ring.stroke()
 
-        # ── Gradient arc ─────────────────────────────────────────────────────
-        if vis and ts.state != ts.IDLE and ts.total_secs > 0:
+        # ── Arc ──────────────────────────────────────────────────────────────
+        if ts.state == ts.IDLE:
+            # アイドル時: フルアークを薄く表示
+            idle = NSBezierPath.bezierPath()
+            idle.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise_(
+                center, R, 90.0, 90.0 - 359.9, True)
+            idle.setLineWidth_(2.0)
+            ns(acc, 0.20).set()
+            idle.stroke()
+        elif vis and ts.total_secs > 0:
+            # グラデーションアーク (32セグメント)
             ratio = ts.remaining / ts.total_secs
             if ratio > 0.001:
                 total_deg = ratio * 360.0
                 N = 32
                 step = total_deg / N
                 for i in range(N):
-                    alpha = 1.0 - (i / N) * 0.65  # head bright, tail dim
+                    alpha = 1.0 - (i / N) * 0.65
                     seg_start = 90.0 - i * step
                     seg_end   = seg_start - step
                     seg = NSBezierPath.bezierPath()
@@ -231,10 +272,9 @@ class TimerView(NSView):
         # ── Time text ────────────────────────────────────────────────────────
         m, s = divmod(ts.remaining, 60)
         time_str = f'{m:02d}:{s:02d}'
-        font = NSFont.fontWithName_size_('Courier Bold', 22.0) or \
-               NSFont.boldSystemFontOfSize_(22.0)
-        para = NSMutableParagraphStyle.alloc().init()
-        para.setAlignment_(NSCenterTextAlignment)
+        font = (NSFont.fontWithName_size_('Menlo-Bold', 22.0) or
+                NSFont.fontWithName_size_('Courier Bold', 22.0) or
+                NSFont.boldSystemFontOfSize_(22.0))
         shadow = NSShadow.alloc().init()
         shadow.setShadowColor_(NSColor.colorWithWhite_alpha_(0.0, 0.7))
         shadow.setShadowOffset_(NSMakeSize(0, -1))
@@ -249,8 +289,10 @@ class TimerView(NSView):
         ns_str.drawAtPoint_(NSMakePoint(CX - sz.width / 2, CY - sz.height / 2 + 1))
 
         # ── Mode / hint label ────────────────────────────────────────────────
-        sfont = NSFont.fontWithName_size_('Helvetica', 9.0) or \
+        sfont = NSFont.fontWithName_size_('Menlo', 9.0) or \
                 NSFont.systemFontOfSize_(9.0)
+        para = NSMutableParagraphStyle.alloc().init()
+        para.setAlignment_(NSCenterTextAlignment)
         label = None
         if ts.state in (ts.RUNNING, ts.PAUSED):
             label = '集中' if ts.is_focus else '休憩'
@@ -294,7 +336,7 @@ class TimerView(NSView):
     def mouseDown_(self, event):
         self._press   = True
         self._moved   = False
-        self._accum_d = 0.0  # accumulated drag distance
+        self._accum_d = 0.0
 
     def mouseDragged_(self, event):
         if not self._press:
@@ -346,7 +388,7 @@ class TimerView(NSView):
 
         menu.addItem_(NSMenuItem.separatorItem())
 
-        # Color theme submenu
+        # カラーテーマサブメニュー
         sub = NSMenu.alloc().init()
         for key, th in THEMES.items():
             mark = '● ' if key == ts.color_theme else '  '
@@ -359,6 +401,20 @@ class TimerView(NSView):
             'カラーテーマ', None, '')
         theme_item.setSubmenu_(sub)
         menu.addItem_(theme_item)
+
+        # 透明度サブメニュー
+        opacity_sub = NSMenu.alloc().init()
+        for v, label in [(1.0, '100%'), (0.6, '60%'), (0.3, '30%')]:
+            mark = '● ' if abs(v - ts.opacity) < 0.05 else '  '
+            oi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                mark + label, 'menuSetOpacity:', '')
+            oi.setTarget_(self)
+            oi.setRepresentedObject_(str(v))
+            opacity_sub.addItem_(oi)
+        opacity_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            '透明度', None, '')
+        opacity_item.setSubmenu_(opacity_sub)
+        menu.addItem_(opacity_item)
 
         menu.addItem_(NSMenuItem.separatorItem())
         auto_lbl = f'自動開始: {"ON → OFF" if ts.auto_start else "OFF → ON"}'
@@ -411,13 +467,23 @@ class TimerView(NSView):
 
     def menuSetTheme_(self, sender):
         try:
-            key = str(sender.representedObject())  # NSString → Python str
+            key = str(sender.representedObject())
             if key in THEMES:
                 self.ts.color_theme = key
                 self.ts.save()
                 self._refresh()
         except Exception as e:
             print(f'menuSetTheme_ error: {e}')
+
+    def menuSetOpacity_(self, sender):
+        try:
+            v = float(str(sender.representedObject()))
+            self.ts.opacity = v
+            self.ts.save()
+            self.window().setAlphaValue_(v)
+            self._refresh()
+        except Exception as e:
+            print(f'menuSetOpacity_ error: {e}')
 
     def menuToggleAuto_(self, sender):
         try:
@@ -462,18 +528,17 @@ class AppDelegate(NSObject):
     def applicationDidFinishLaunching_(self, note):
         ts = TimerState()
 
-        # Position (AppKit: y=0 is bottom of screen)
+        # 位置（AppKit: y=0 は画面下端）
         screen = NSScreen.mainScreen().visibleFrame()
-        full_h = NSScreen.mainScreen().frame().size.height
-        if ts.cfg_x is not None and ts.cfg_y is not None:
-            x = ts.cfg_x
-            # Convert old tkinter coords (y from top) to AppKit (y from bottom) if needed
-            y = ts.cfg_y if ts.cfg_y > full_h / 2 else full_h - ts.cfg_y - W
+        if ts.cfg_x is not None and ts.cfg_y is not None and ts.coords_version >= 2:
+            # AppKit座標をそのまま使用
+            x, y = ts.cfg_x, ts.cfg_y
         else:
+            # デフォルト: 画面右上
             x = screen.origin.x + screen.size.width - W - 20
-            y = screen.origin.y + screen.size.height - W - 20  # top-right
+            y = screen.origin.y + screen.size.height - W - 20
 
-        # Create transparent floating panel
+        # 透明フローティングパネル生成
         panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(x, y, W, W), 0, NSBackingStoreBuffered, False)
         panel.setBackgroundColor_(NSColor.clearColor())
@@ -486,6 +551,7 @@ class AppDelegate(NSObject):
         panel.setIgnoresMouseEvents_(False)
         panel.setMovableByWindowBackground_(False)
         panel.setHidesOnDeactivate_(False)
+        panel.setAlphaValue_(ts.opacity)
 
         view = TimerView.alloc().initWithFrame_(
             NSMakeRect(0, 0, W, W))
@@ -497,7 +563,7 @@ class AppDelegate(NSObject):
         self.panel = panel
         self.view  = view
 
-        # Periodic redraw
+        # 定期再描画 (150ms)
         self.tick_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             0.15, self, 'tick:', None, True)
 
@@ -505,16 +571,15 @@ class AppDelegate(NSObject):
         self.view.setNeedsDisplay_(True)
 
     def applicationShouldTerminateAfterLastWindowClosed_(self, _):
-        # NSPanel は "window" としてカウントされないため、
-        # メニューを閉じた瞬間に終了しないよう False を返す。
-        # 終了は右クリック→「終了」メニューから行う。
+        # NSPanel はウィンドウとしてカウントされないため False を返す
+        # 終了は右クリック→「終了」から行う
         return False
 
 
 # ---------------------------------------------------------------------------
 def main():
     app = NSApplication.sharedApplication()
-    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)  # no dock icon
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)  # Dockアイコン非表示
     delegate = AppDelegate.alloc().init()
     app.setDelegate_(delegate)
     app.activateIgnoringOtherApps_(True)
