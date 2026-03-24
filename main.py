@@ -821,7 +821,7 @@ class TimerView(NSView):
         gr = DC.GLOW_R
         self._glow_oval = NSMakeRect(CX - gr, CY - gr, gr * 2, gr * 2)      # B5
 
-    def _font(self, size: float) -> NSFont:
+    def _mk_font(self, size: float) -> NSFont:
         if size not in self._font_cache:
             self._font_cache[size] = (
                 NSFont.fontWithName_size_('Menlo-Bold', size) or
@@ -1016,7 +1016,7 @@ class TimerView(NSView):
         elif ts.state == ts.FINISHED and not ts.flash_visible():
             t_alpha = 0.0
         attrs = {
-            NSFontAttributeName:            self._font(fsize),
+            NSFontAttributeName:            self._mk_font(fsize),
             NSForegroundColorAttributeName: ns(acc, t_alpha),
             NSShadowAttributeName:          self._shadow,
         }
@@ -1516,18 +1516,18 @@ class TimerView(NSView):
         self.ts.save()
         self.setNeedsDisplay_(True)
 
-    # F27: VoiceOver support
-    def accessibilityRole_(self):
+    # F27: VoiceOver support (no trailing underscore = zero-arg ObjC getter)
+    def accessibilityRole(self):
         return 'AXGroup'
 
-    def accessibilityLabel_(self):
+    def accessibilityLabel(self):
         if not self.ts:
             return 'ポモドーロタイマー'
         ts = self.ts
         mode = '集中' if ts.is_focus else '休憩'
         return f'ポモドーロタイマー {mode}モード'
 
-    def accessibilityValue_(self):
+    def accessibilityValue(self):
         if not self.ts:
             return ''
         ts = self.ts
