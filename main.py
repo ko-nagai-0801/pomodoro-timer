@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Pomodoro Timer v3.2 – Pure AppKit transparent floating overlay"""
+"""Pomodoro Timer v3.3 – Pure AppKit transparent floating overlay"""
 
-__version__ = '3.2.0'
+__version__ = '3.3.0'
 
 import time, json, os, tempfile, subprocess, csv, shutil, math, threading, logging
 from datetime import date, timedelta
@@ -77,7 +77,9 @@ SHORTCUTS_HELP = [
     'Cmd+Shift+P: 一時停止 / 再開',
     'Cmd+Shift+N: スキップ',
     'Cmd+Shift+R: リセット',
+    'Cmd+Shift+Z: 元に戻す',
     'Cmd+Shift+E: +5分延長',
+    'Cmd+Shift+H: 表示 / 非表示',
     'Cmd+Shift+S: 週間統計',
     'スクロール: IDLE時に時間調整',
 ]
@@ -103,6 +105,8 @@ WORK_OPTIONS  = [15*60, 20*60, 25*60, 30*60, 45*60, 50*60, 60*60, 90*60, 120*60]
 BREAK_OPTIONS = [5*60, 10*60, 15*60, 20*60]
 OPACITY_OPTIONS  = [(1.0, '100%'), (0.6, '60%'), (0.3, '30%')]
 AUTO_START_MODES = ['手動', 'フェーズ自動', '完全自動']
+DAILY_GOAL_OPTIONS = [4, 6, 8, 10, 12]   # H25
+VOLUME_OPTIONS = [(1.0, '100%'), (0.6, '60%'), (0.3, '30%')]   # H26
 
 # #33: achievement definitions (id, display name, total count threshold)
 ACHIEVEMENTS = [
@@ -126,9 +130,13 @@ _LEGACY_HIST   = os.path.expanduser('~/.pomodoro-timer/history.json')
 # ── Logging ───────────────────────────────────────────────────────────────────
 def _setup_log():
     os.makedirs(_APP_SUPPORT, exist_ok=True)
-    logging.basicConfig(
-        filename=LOG_PATH, level=logging.WARNING,
-        format='%(asctime)s %(levelname)s %(message)s')
+    # G23: RotatingFileHandler prevents unbounded log growth (500 KB × 2 files)
+    from logging.handlers import RotatingFileHandler
+    handler = RotatingFileHandler(LOG_PATH, maxBytes=500*1024, backupCount=2,
+                                  encoding='utf-8')
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.WARNING)
 
 def _log(msg, level=logging.WARNING):
     try:
@@ -184,12 +192,22 @@ def _invalidate_dark_cache():
 def _resolve_theme(key: str) -> dict:
     return THEMES['mono' if _is_dark() else 'blue'] if key == 'auto' else THEMES.get(key, THEMES['blue'])
 
+_reduce_motion_cache: bool = False
+_reduce_motion_t: float = 0.0
+
 def _should_reduce_motion() -> bool:
-    """F28: respect macOS Reduce Motion accessibility setting."""
+    """F28/C10: cached Reduce Motion check (1s TTL)."""
+    global _reduce_motion_cache, _reduce_motion_t
+    now = time.monotonic()
+    if now - _reduce_motion_t < 1.0:
+        return _reduce_motion_cache
     try:
-        return bool(NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion())
+        _reduce_motion_cache = bool(
+            NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion())
     except Exception:
-        return False
+        _reduce_motion_cache = False
+    _reduce_motion_t = now
+    return _reduce_motion_cache
 
 # ── Backup (#23) ──────────────────────────────────────────────────────────────
 def _do_backup():
@@ -328,13 +346,15 @@ class TimerHistory:
     def weekly_data(self) -> list:
         """Returns list of (date_str, count) for last 7 days, oldest first."""
         today = date.today()
-        return [(( today - timedelta(days=6-i)).isoformat(),
-                  self._d.get((today - timedelta(days=6-i)).isoformat(), {}).get('count', 0))
-                for i in range(7)]
+        with self._lock:  # B7: thread-safe read
+            return [((today - timedelta(days=6-i)).isoformat(),
+                      self._d.get((today - timedelta(days=6-i)).isoformat(), {}).get('count', 0))
+                    for i in range(7)]
 
     def check_achievements(self) -> list:
         """Returns newly unlocked achievement display names."""
-        total = sum(e.get('count', 0) for e in self._d.values())
+        with self._lock:  # B8: thread-safe read
+            total = sum(e.get('count', 0) for e in self._d.values())
         ach_path = os.path.join(_APP_SUPPORT, 'achievements.json')
         try:
             with open(ach_path) as f:
@@ -357,11 +377,22 @@ class TimerHistory:
         return new
 
     def export_csv(self, path: str):
+        with self._lock:  # B9: thread-safe snapshot
+            snap = {k: v.get('count', 0) for k, v in self._d.items()}
         with open(path, 'w', newline='', encoding='utf-8') as f:
             w = csv.writer(f)
             w.writerow(['日付', 'ポモドーロ数'])
-            for d in sorted(self._d):
-                w.writerow([d, self._d[d].get('count', 0)])
+            for d in sorted(snap):
+                w.writerow([d, snap[d]])
+
+    def reset_today(self):
+        """F22: reset today's count in history."""
+        k = date.today().isoformat()
+        with self._lock:
+            if k in self._d:
+                self._d[k]['count'] = 0
+                self._d[k]['times'] = []
+        self._save_bg()
 
 
 # ── Timer State ───────────────────────────────────────────────────────────────
@@ -373,6 +404,8 @@ class TimerState:
     def __init__(self):
         self._load_config()
         self.history      = TimerHistory()
+        # G24: sync pomodoro_count with history (authoritative source)
+        self.pomodoro_count = self.history.today_count()
         self.state        = self.IDLE
         self.is_focus     = True
         self.total_secs   = float(self.work_duration)
@@ -407,7 +440,8 @@ class TimerState:
                  window_x=None, window_y=None, coords_version=0,
                  pomodoro_count=0, last_date='',
                  auto_start=0, color_theme='blue', opacity=1.0,
-                 notify_sound='Glass', auto_launch=False, always_dots=False)
+                 notify_sound='Glass', auto_launch=False, always_dots=False,
+                 daily_goal=8, notify_volume=1.0)
         if not os.path.exists(CONFIG_PATH) and os.path.exists(_LEGACY_CONFIG):
             try:
                 shutil.copy2(_LEGACY_CONFIG, CONFIG_PATH)
@@ -456,16 +490,22 @@ class TimerState:
         self.notify_sound = d.get('notify_sound', 'Glass')
         if self.notify_sound not in SOUNDS:
             self.notify_sound = 'Glass'
-        self.auto_launch  = bool(d.get('auto_launch', False))
-        self.always_dots  = bool(d.get('always_dots', False))
+        self.auto_launch    = bool(d.get('auto_launch', False))
+        self.always_dots    = bool(d.get('always_dots', False))
+        self.daily_goal     = max(1, min(20, int(d.get('daily_goal', 8))))        # H25
+        self.notify_volume  = max(0.1, min(1.0, float(d.get('notify_volume', 1.0))))  # H26
 
     def save(self, wx=None, wy=None):
+        # A3: preserve last known position if not explicitly provided
+        if wx is None: wx = self.cfg_x
+        if wy is None: wy = self.cfg_y
         data = dict(work_duration=self.work_duration, break_duration=self.break_duration,
                     window_x=wx, window_y=wy, coords_version=COORDS_VERSION,
                     pomodoro_count=self.pomodoro_count, last_date=self.last_date,
                     auto_start=self.auto_start, color_theme=self.color_theme,
                     opacity=self.opacity, notify_sound=self.notify_sound,
-                    auto_launch=self.auto_launch, always_dots=self.always_dots)
+                    auto_launch=self.auto_launch, always_dots=self.always_dots,
+                    daily_goal=self.daily_goal, notify_volume=self.notify_volume)
         def _do():
             try:
                 fd, tmp = tempfile.mkstemp(dir=_APP_SUPPORT)
@@ -511,6 +551,7 @@ class TimerState:
             try:
                 snd = NSSound.soundNamed_(self.notify_sound)
                 if snd:
+                    snd.setVolume_(self.notify_volume)   # H26
                     snd.play()
             except Exception:
                 pass
@@ -559,17 +600,23 @@ class TimerState:
                 self.remaining = 0.0
                 self.state    = self.FINISHED
                 self._flash_t = time.monotonic()
-                if self.is_focus:
+                if self.is_focus and not getattr(self, '_phase_notified', False):
+                    self._phase_notified = True
                     self.pomodoro_count += 1
                     new_ach = self.history.record(self.current_memo)
                     self.current_memo = ''
                     for ach in new_ach:
                         self._notify('🏆 実績解除！', ach)
-                self.save()
-                self._notify()
+                    self.save()
+                    self._notify()
+                elif not self.is_focus and not getattr(self, '_phase_notified', False):
+                    self._phase_notified = True
+                    self.save()
+                    self._notify()
 
         if self.state == self.FINISHED and self.auto_start >= 1:
-            if time.monotonic() - self._flash_t >= 3.0:
+            _now = time.monotonic()
+            if _now - self._flash_t >= 3.0:
                 self._advance_phase()
 
         # D20: wake countdown auto-resume
@@ -580,26 +627,26 @@ class TimerState:
                     self._mono_start = time.monotonic()
                     self.state = self.RUNNING
 
-    def flash_visible(self) -> bool:
+    def flash_visible(self, now: float) -> bool:
         if self.state == self.FINISHED:
-            e = time.monotonic() - self._flash_t
+            e = now - self._flash_t
             return True if e > 3.0 else e % 0.5 < 0.3
         return True
 
-    def paused_alpha(self) -> float:
+    def paused_alpha(self, now: float) -> float:
         if self.state == self.PAUSED:
-            return 0.35 + 0.65 * (0.5 + 0.5 * math.sin(time.monotonic() * math.pi * 1.2))
+            return 0.35 + 0.65 * (0.5 + 0.5 * math.sin(now * math.pi * 1.2))
         return 1.0
 
-    def trans_alpha(self) -> float:
+    def trans_alpha(self, now: float) -> float:
         if self.state == self.RUNNING:
-            p = min(1.0, (time.monotonic() - self._trans_t) / DC.TRANS_FADE)
+            p = min(1.0, (now - self._trans_t) / DC.TRANS_FADE)
             return p * p * (3.0 - 2.0 * p)
         return 1.0
 
-    def auto_cd_remaining(self) -> float:
+    def auto_cd_remaining(self, now: float) -> float:
         if self.state == self.FINISHED and self.auto_start >= 1:
-            return max(0.0, 3.0 - (time.monotonic() - self._flash_t))
+            return max(0.0, 3.0 - (now - self._flash_t))
         return 0.0
 
     @property
@@ -607,13 +654,13 @@ class TimerState:
         return not self.is_focus and self.total_secs >= self.LONG_BREAK
 
     def _do_start(self):
-        # G33: single time.monotonic() call
         t = time.monotonic()
-        self._trans_t    = t
-        self._mono_start = t
-        self._warned_60  = False
-        self._warned_30  = False
-        self.state       = self.RUNNING
+        self._trans_t        = t
+        self._mono_start     = t
+        self._warned_60      = False
+        self._warned_30      = False
+        self._phase_notified = False   # H30: reset dedup flag on new session
+        self.state           = self.RUNNING
 
     def _advance_phase(self):
         # #8: record old accent for crossfade
@@ -658,9 +705,13 @@ class TimerState:
         for k, v in snap.items():
             setattr(self, k, v)
         self._warned_60 = False; self._warned_30 = False
+        # A5: RUNNING state can't be safely restored (_mono_start is stale)
+        if self.state == self.RUNNING:
+            self.state = self.PAUSED
+            self._paused_rem = self.remaining
 
     def reset(self):
-        self._undo_snap = self._snap(); self._undo_t = time.monotonic()  # D21
+        self._undo_snap = self._snap(); self._undo_t = time.monotonic()
         self.state        = self.IDLE
         self.is_focus     = True
         self.total_secs   = float(self.work_duration)
@@ -669,9 +720,10 @@ class TimerState:
         self.current_memo = ''
         self._warned_60   = False
         self._warned_30   = False
+        self._extend_t    = 0.0   # A4: clear extend feedback
 
     def skip(self):
-        self._undo_snap = self._snap(); self._undo_t = time.monotonic()  # D21
+        self._undo_snap = self._snap(); self._undo_t = time.monotonic()
         # #8: record old accent
         self._old_accent_hex = self.accent_hex
         self._phase_change_t = time.monotonic()
@@ -682,6 +734,7 @@ class TimerState:
         self.total_secs  = dur; self._paused_rem = dur; self.remaining = dur
         self.state       = self.IDLE
         self._warned_60  = False; self._warned_30 = False
+        self._extend_t   = 0.0   # A4: clear extend feedback
         self.save()
 
     def can_undo(self) -> bool:
@@ -726,8 +779,9 @@ class TimerState:
         return 0.0
 
     def reset_pomodoro_count(self):
-        """E26: reset today's count."""
+        """E26/F22: reset today's count in state and history."""
         self.pomodoro_count = 0
+        self.history.reset_today()
         self.save()
 
 
@@ -820,6 +874,14 @@ class TimerView(NSView):
         self._base_oval = NSMakeRect(CX - R, CY - R, R * 2, R * 2)          # #1
         gr = DC.GLOW_R
         self._glow_oval = NSMakeRect(CX - gr, CY - gr, gr * 2, gr * 2)      # B5
+        # C12: pre-compute tick mark endpoints (12/3/6/9 o'clock)
+        self._tick_pts = []
+        for deg in (90.0, 0.0, 270.0, 180.0):
+            rad = math.radians(deg)
+            self._tick_pts.append((
+                NSMakePoint(CX + (R + 1) * math.cos(rad), CY + (R + 1) * math.sin(rad)),
+                NSMakePoint(CX + (R + 7) * math.cos(rad), CY + (R + 7) * math.sin(rad)),
+            ))
 
     def _mk_font(self, size: float) -> NSFont:
         if size not in self._font_cache:
@@ -849,15 +911,12 @@ class TimerView(NSView):
         t      = ts.theme
         acc    = ts.accent_hex
         center = NSMakePoint(CX, CY)
-        ta     = ts.trans_alpha()
-        pa     = ts.paused_alpha()
+        ta     = ts.trans_alpha(now)
+        pa     = ts.paused_alpha(now)
         oval   = self._base_oval   # #1: reuse cached rect
         base_a = 0.9 if _is_dark() else 1.0
 
-        # #18: smooth hover line width transition
-        lw_target  = 3.6 if ts.hover else 3.0
-        self._lw_cur += (lw_target - self._lw_cur) * 0.2
-        base_lw = self._lw_cur
+        base_lw = self._lw_cur   # A1: lerp is now only in tick_; removed duplicate here
 
         # #16: outer glow ring (B5: use cached oval)
         glow_circ = NSBezierPath.bezierPathWithOvalInRect_(self._glow_oval)
@@ -887,14 +946,10 @@ class TimerView(NSView):
             ns(t['base'], base_a).set()
             ring.stroke()
 
-        # C9: clock-face tick marks at 12/3/6/9 positions
-        for deg in (90.0, 0.0, 270.0, 180.0):
-            rad = math.radians(deg)
-            ix = CX + (R - 2) * math.cos(rad); iy = CY + (R - 2) * math.sin(rad)
-            ox2 = CX + (R + 4) * math.cos(rad); oy2 = CY + (R + 4) * math.sin(rad)
+        # C9/C12/E17: clock-face tick marks (pre-computed, outside ring only: R+1 to R+7)
+        for p0, p1 in self._tick_pts:
             tick = NSBezierPath.bezierPath()
-            tick.moveToPoint_(NSMakePoint(ix, iy))
-            tick.lineToPoint_(NSMakePoint(ox2, oy2))
+            tick.moveToPoint_(p0); tick.lineToPoint_(p1)
             tick.setLineWidth_(1.5)
             ns(t['base'], 0.6).set()
             tick.stroke()
@@ -937,7 +992,7 @@ class TimerView(NSView):
 
         elif ts.total_secs > 0:
             ratio = ts.remaining / max(0.001, ts.total_secs)  # #5: guard
-            vis   = ts.flash_visible()
+            vis   = ts.flash_visible(now)
             if ratio > 0.001 and vis:
                 total_deg = ratio * 360.0
                 # #19: dynamic segment count
@@ -961,9 +1016,9 @@ class TimerView(NSView):
                     ns(acc, alpha).set()
                     seg.stroke()
 
-        # C12: seconds arc inside base ring for last 60s
+        # C12/E19: seconds arc inside base ring for last 60s (R-10 avoids text overlap)
         if ts.state == ts.RUNNING and 0 < ts.remaining <= 60:
-            sec_r = R - 8
+            sec_r = R - 10
             sec_ratio = ts.remaining / 60.0
             sec_arc = NSBezierPath.bezierPath()
             sec_arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise_(
@@ -974,7 +1029,7 @@ class TimerView(NSView):
             sec_arc.stroke()
 
         # ── Completion pulse ring (C16: expanding ring on FINISHED) ───────────
-        if ts.state == ts.FINISHED and ts.flash_visible():
+        if ts.state == ts.FINISHED and ts.flash_visible(now):
             pulse = NSBezierPath.bezierPathWithOvalInRect_(oval)
             pulse.setLineWidth_(4.0)
             ns(acc, 0.7).set()
@@ -1013,7 +1068,7 @@ class TimerView(NSView):
         t_alpha = 0.95
         if ts.state == ts.PAUSED:
             t_alpha *= pa
-        elif ts.state == ts.FINISHED and not ts.flash_visible():
+        elif ts.state == ts.FINISHED and not ts.flash_visible(now):
             t_alpha = 0.0
         attrs = {
             NSFontAttributeName:            self._mk_font(fsize),
@@ -1070,7 +1125,7 @@ class TimerView(NSView):
             ls.drawAtPoint_(NSMakePoint(CX - lsz.width / 2, CY - R + 6))
 
         # #20: auto-start countdown
-        cd = ts.auto_cd_remaining()
+        cd = ts.auto_cd_remaining(now)
         if cd > 0:
             cd_text = f'自動開始まで {math.ceil(cd)}秒'
             cd_attr = {NSFontAttributeName: self._small_font(),
@@ -1086,6 +1141,16 @@ class TimerView(NSView):
             done  = ts.pomodoro_count % n
             set_n = ts.pomodoro_count // n + 1
             base_y = CY - R + 22
+            # H25: daily goal progress above dots
+            today_done = ts.history.today_count()
+            goal_str = f'今日 {today_done}/{ts.daily_goal}'
+            goal_a = 1.0 if today_done >= ts.daily_goal else 0.6
+            ga = {NSFontAttributeName: self._small_font(),
+                  NSForegroundColorAttributeName: ns(acc if today_done >= ts.daily_goal else t['mode'], goal_a),
+                  NSParagraphStyleAttributeName:  self._para}
+            gs = NSAttributedString.alloc().initWithString_attributes_(goal_str, ga)
+            gsz = gs.size()
+            gs.drawAtPoint_(NSMakePoint(CX - gsz.width / 2, base_y + 20))
             if set_n > 1:
                 sl = {NSFontAttributeName: self._small_font(),
                       NSForegroundColorAttributeName: ns(t['mode'], 0.6),
@@ -1134,6 +1199,9 @@ class TimerView(NSView):
 
     def mouseDown_(self, event):
         self._press = True; self._moved = False; self._accum_d = 0.0
+        # H28: double-click snaps to nearest screen corner
+        if event.clickCount() == 2:
+            self._snap_to_corner()
 
     def mouseDragged_(self, event):
         if not self._press: return
@@ -1147,9 +1215,10 @@ class TimerView(NSView):
 
     def mouseUp_(self, event):
         if not self._moved and self.ts:
-            # D21: undo takes priority if within grace window
-            if self.ts.can_undo():
-                self.ts.undo()
+            # A2: undo removed from left-click; use menu or Cmd+Z only
+            # F21: cancel wake countdown on click
+            if self.ts._wake_cd_active:
+                self.ts._wake_cd_active = False
             else:
                 self.ts.handle_click()
             self.setNeedsDisplay_(True)
@@ -1161,6 +1230,29 @@ class TimerView(NSView):
                 self.window().setFrame_display_(f, True)
             self.ts.save(sx, sy)
         self._press = False; self._moved = False; self._accum_d = 0.0
+
+    def _snap_to_corner(self):
+        """H28: snap window to nearest screen corner."""
+        try:
+            win = self.window()
+            f   = win.frame()
+            cx  = f.origin.x + W / 2
+            cy  = f.origin.y + W / 2
+            scr = NSScreen.mainScreen().visibleFrame()
+            margin = 16
+            corners = [
+                (scr.origin.x + margin,                          scr.origin.y + margin),
+                (scr.origin.x + scr.size.width - W - margin,    scr.origin.y + margin),
+                (scr.origin.x + margin,                          scr.origin.y + scr.size.height - W - margin),
+                (scr.origin.x + scr.size.width - W - margin,    scr.origin.y + scr.size.height - W - margin),
+            ]
+            nx, ny = min(corners, key=lambda p: (p[0]+W/2-cx)**2 + (p[1]+W/2-cy)**2)
+            f.origin.x = nx; f.origin.y = ny
+            win.setFrame_display_animate_(f, True, True)
+            if self.ts:
+                self.ts.save(int(nx), int(ny))
+        except Exception as e:
+            _log(f'_snap_to_corner: {e}')
 
     def _clamp_to_screen(self, x: int, y: int):
         """#20: keep window within screen bounds."""
@@ -1188,9 +1280,9 @@ class TimerView(NSView):
         """items: [(title, sel, repr_str, is_selected), ...]"""
         sub = NSMenu.alloc().init()
         for title, sel, repr_str, selected in items:
-            mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                ('● ' if selected else '  ') + title, sel, '')
+            mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, sel, '')
             mi.setTarget_(self)
+            mi.setState_(1 if selected else 0)   # E18: NSOnState/NSOffState checkmark
             if repr_str:
                 mi.setRepresentedObject_(repr_str)
             sub.addItem_(mi)
@@ -1271,14 +1363,29 @@ class TimerView(NSView):
         add(f'ログイン時に自動起動: {"ON → OFF" if ts.auto_launch else "OFF → ON"}',
             'menuToggleAutoLaunch:')
 
+        # H25: daily goal submenu
+        gsub = self._mk_submenu([
+            (f'{g}個', 'menuSetGoal:', str(g), g == ts.daily_goal)
+            for g in DAILY_GOAL_OPTIONS])
+        gi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            f'1日の目標: {ts.daily_goal}個', None, '')
+        gi.setSubmenu_(gsub); menu.addItem_(gi)
+
+        # H26: sound volume submenu
+        vsub = self._mk_submenu([
+            (lbl, 'menuSetVolume:', str(v), abs(v - ts.notify_volume) < 0.05)
+            for v, lbl in VOLUME_OPTIONS])
+        vi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            f'通知音量: {int(ts.notify_volume*100)}%', None, '')
+        vi.setSubmenu_(vsub); menu.addItem_(vi)
+
         menu.addItem_(NSMenuItem.separatorItem())
 
-        # #21/#25: statistics line
-        fmins = ts.history.today_focus_mins(ts.work_duration)
-        stk   = ts.history.streak()
+        # B6: single snapshot for all stats to avoid repeated lock acquisitions
+        _tc = ts.history.today_count(); _wc = ts.history.week_count()
+        _fmins = ts.history.today_focus_mins(ts.work_duration); _stk = ts.history.streak()
         stat  = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            f'今日: {ts.history.today_count()}個  今週: {ts.history.week_count()}個  '
-            f'集中: {fmins}分  🔥{stk}日', None, '')
+            f'今日: {_tc}個  今週: {_wc}個  集中: {_fmins}分  🔥{_stk}日', None, '')
         stat.setEnabled_(False); menu.addItem_(stat)
 
         add('📊 週間統計を見る', 'menuShowStats:')
@@ -1469,6 +1576,21 @@ class TimerView(NSView):
             self.ts.reset_pomodoro_count(); self._refresh()
         except Exception as e: _log(f'menuResetCount_: {e}')
 
+    def menuSetGoal_(self, sender):   # H25
+        try:
+            g = max(1, min(20, _rep_int(sender, 8)))
+            self.ts.daily_goal = g; self.ts.save(); self._refresh()
+        except Exception as e: _log(f'menuSetGoal_: {e}')
+
+    def menuSetVolume_(self, sender):   # H26
+        try:
+            v = max(0.1, min(1.0, _rep_float(sender, 1.0)))
+            self.ts.notify_volume = v; self.ts.save()
+            if self.ts.notify_sound != 'なし':
+                snd = NSSound.soundNamed_(self.ts.notify_sound)
+                if snd: snd.setVolume_(v); snd.play()
+        except Exception as e: _log(f'menuSetVolume_: {e}')
+
     def menuQuit_(self, _):
         try:
             self.ts.save()
@@ -1557,8 +1679,9 @@ class AppDelegate(NSObject):
             x = int(f.origin.x + f.size.width  - W - 20)
             y = int(f.origin.y + f.size.height - W - 20)
 
+        # D14: NSNonactivatingPanelMask=128 prevents stealing keyboard focus
         panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(x, y, W, W), 0, NSBackingStoreBuffered, False)
+            NSMakeRect(x, y, W, W), 128, NSBackingStoreBuffered, False)
         panel.setBackgroundColor_(NSColor.clearColor())
         panel.setOpaque_(False); panel.setHasShadow_(False)
         panel.setLevel_(NSFloatingWindowLevel)
@@ -1576,10 +1699,12 @@ class AppDelegate(NSObject):
         view.updateTrackingAreas()
         panel.orderFrontRegardless()
 
-        self._panel       = panel
-        self._view        = view
-        self._key_monitor = None
-        self._idle_skip   = 0    # B7: adaptive redraw counter
+        self._panel          = panel
+        self._view           = view
+        self._key_monitor    = None
+        self._idle_skip      = 0      # B7: adaptive redraw counter
+        self._status_today   = 0      # C11: cached today_count for status bar
+        self._status_today_t = 0.0    # C11: last update time
 
         self._tick_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             DC.TICK, self, 'tick:', None, True)
@@ -1648,6 +1773,16 @@ class AppDelegate(NSObject):
             self._status_item = None
 
     def _setup_key_monitor(self):
+        # D16: check Accessibility permission before attempting global monitor
+        try:
+            from ApplicationServices import AXIsProcessTrustedWithOptions
+            opts = {'AXTrustedCheckOptionPrompt': False}
+            if not AXIsProcessTrustedWithOptions(opts):
+                _log('Accessibility permission not granted — global shortcuts disabled. '
+                     'Enable in System Settings → Privacy & Security → Accessibility.',
+                     logging.INFO)
+        except Exception:
+            pass
         try:
             self._key_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
                 _KEY_DOWN_MASK, self._on_key)
@@ -1665,6 +1800,11 @@ class AppDelegate(NSObject):
             elif ch == 'n': ts.skip();         self._view.setNeedsDisplay_(True)
             elif ch == 'r': ts.reset();        self._view.setNeedsDisplay_(True)
             elif ch == 'e': ts.extend();       self._view.setNeedsDisplay_(True)   # D18
+            elif ch == 'z': ts.undo();         self._view.setNeedsDisplay_(True)   # F20: Cmd+Shift+Z
+            elif ch == 'h':                                                          # H27
+                w = self._panel
+                if w.isVisible(): w.orderOut_(None)
+                else: w.orderFrontRegardless()
             elif ch == 's':                                                          # D19
                 self._view.menuShowStats_(None)
         except Exception as e:
@@ -1705,9 +1845,12 @@ class AppDelegate(NSObject):
                     self._status_item.button().setTitle_(
                         f'{icon} {m:02d}:{s:02d} ({done}/{ts.SET_SIZE} S{set_n})')
                 else:
-                    # E23: IDLE shows today's count
-                    today_n = ts.history.today_count()
-                    lbl = f'⏱ 今日{today_n}個' if today_n > 0 else '⏱'
+                    # C11/E23: cached today_count (refresh every 60s)
+                    _t = time.monotonic()
+                    if _t - self._status_today_t > 60.0:
+                        self._status_today   = ts.history.today_count()
+                        self._status_today_t = _t
+                    lbl = f'⏱ 今日{self._status_today}個' if self._status_today > 0 else '⏱'
                     self._status_item.button().setTitle_(lbl)
         except Exception:
             pass
@@ -1792,7 +1935,7 @@ def main():
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     delegate = AppDelegate.alloc().init()
     app.setDelegate_(delegate)
-    app.activateIgnoringOtherApps_(True)
+    app.activateIgnoringOtherApps_(False)  # D15: accessory app should not steal focus
     app.run()
 
 
